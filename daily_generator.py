@@ -14,7 +14,7 @@ import json, time, re, os, logging, schedule
 from datetime import datetime, timedelta
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBlFGnINpMfqoXL1XNay99Vman8Fd8MOdM")
-SERVICE_ACCOUNT_PATH = os.environ.get("SERVICE_ACCOUNT_PATH", "scripts/serviceAccountKey.json")
+SERVICE_ACCOUNT_PATH = os.environ.get("SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
 QUESTIONS_PER_EXAM = 10
 GENERATE_EXTRA = 5
 DELAY_API = 8
