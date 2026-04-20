@@ -49,12 +49,21 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 def init_firebase():
     if not firebase_admin._apps:
-        creds_json = os.environ.get("FIREBASE_CREDENTIALS")
-        if creds_json:
-            cred_dict = json.loads(creds_json)
+        # Try base64 encoded credentials first
+        creds_b64 = os.environ.get("FIREBASE_CREDENTIALS_B64")
+        if creds_b64:
+            import base64
+            cred_dict = json.loads(base64.b64decode(creds_b64).decode('utf-8'))
             cred = credentials.Certificate(cred_dict)
         else:
-            cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+            # Try raw JSON credentials
+            creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+            if creds_json:
+                cred_dict = json.loads(creds_json)
+                cred = credentials.Certificate(cred_dict)
+            else:
+                # Fall back to file
+                cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
