@@ -5,7 +5,7 @@ QuizMaster Pro Daily Generator with Duplicate Detection
 - Translates to 11 languages
 - SVG for diagram questions
 - Auto-moves yesterday daily to main pool
-- Rate limit safe: longer delays, model fallback
+- Rate limit safe: longer delays, model fallback, retranslate command
 Schedule: UPSC 6AM, SSC 12PM, Banking 6PM, RRB 12AM (IST)
 """
 import firebase_admin
@@ -22,13 +22,14 @@ QUESTIONS_PER_EXAM = 10
 GENERATE_EXTRA = 5
 DELAY_API = 15
 DELAY_BETWEEN_EXAMS = 600
-DELAY_TRANSLATE = 10
+DELAY_TRANSLATE = 12
 DUPLICATE_THRESHOLD = 0.85
 
+# Only models confirmed working with gemini-2.0-flash API keys
 GEMINI_MODELS = [
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-2.5-flash"
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
 ]
 
 logging.basicConfig(
@@ -124,16 +125,13 @@ def init_firebase():
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
-# ── GEMINI CLIENT ─────────────────────────────────────────────
-def get_client():
-    api_key = GEMINI_API_KEY
-    if not api_key:
-        raise Exception("GEMINI_API_KEY environment variable not set!")
-    return genai.Client(api_key=api_key)
-
+# ── GEMINI CALL WITH FALLBACK ─────────────────────────────────
 def gemini_call(prompt, retries=4):
-    client = get_client()
-    # Minimum delay between ALL calls to respect rate limits
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY not set!")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    # Minimum gap between all API calls
     time.sleep(4)
 
     for model in GEMINI_MODELS:
@@ -157,14 +155,15 @@ def gemini_call(prompt, retries=4):
                     log.warning(f"Server error on {model}. Waiting {wait}s")
                     time.sleep(wait)
                 elif "404" in err or "403" in err:
-                    log.warning(f"Model {model} unavailable, trying next")
-                    break
+                    log.warning(f"Model {model} unavailable, trying next model")
+                    break  # skip remaining retries, try next model
                 else:
                     log.error(f"Unexpected error on {model}: {e}")
                     raise e
+
     raise Exception("All Gemini models failed after all retries")
 
-# ── JSON HELPER ───────────────────────────────────────────────
+# ── JSON CLEANER ──────────────────────────────────────────────
 def clean_json(text):
     text = re.sub(r"```json\s*|```\s*", "", text).strip()
     s, e = text.find("["), text.rfind("]") + 1
@@ -254,32 +253,26 @@ def generate_questions(exam_type, topic, count, existing_sample=None):
     n = count + GENERATE_EXTRA
     avoid = ""
     if existing_sample:
-        avoid = f"\nDo NOT generate questions similar to these existing ones:\n{json.dumps(existing_sample[-8:])}"
+        avoid = (
+            f"\nIMPORTANT - Do NOT generate questions similar to these:\n"
+            f"{json.dumps(existing_sample[-8:])}"
+        )
 
-    prompt = f"""You are an expert Indian competitive exam question setter.
-Generate {n} MCQ questions for {exam_type} exam on topic: {topic}
-{avoid}
-
-Include mix:
-- 8 regular text questions (different sub-topics, real NCERT facts)
-- 2 questions with a simple data table (describe table in question text)
-- 1 question with a diagram (write [DIAGRAM: description] in question text)
-
-Output ONLY valid JSON array:
-[{{
-  "question_en": "full question text",
-  "options_en": ["A", "B", "C", "D"],
-  "correct": 0,
-  "explanation_en": "detailed explanation with facts",
-  "category": "{topic}",
-  "difficulty": "easy",
-  "year": null,
-  "exam_tags": ["{exam_type}"],
-  "has_image": false,
-  "image_description": null
-}}]
-
-For diagram questions: set has_image to true and fill image_description."""
+    prompt = (
+        f"You are an expert Indian competitive exam question setter.\n"
+        f"Generate {n} MCQ questions for {exam_type} exam on topic: {topic}\n"
+        f"{avoid}\n\n"
+        f"Include mix:\n"
+        f"- 8 regular text questions (different sub-topics, real NCERT facts)\n"
+        f"- 2 questions with a simple data table (describe table in question text)\n"
+        f"- 1 question with a diagram (write [DIAGRAM: description] in question text)\n\n"
+        f"Output ONLY valid JSON array:\n"
+        f'[{{"question_en":"full question","options_en":["A","B","C","D"],'
+        f'"correct":0,"explanation_en":"detailed explanation",'
+        f'"category":"{topic}","difficulty":"easy","year":null,'
+        f'"exam_tags":["{exam_type}"],"has_image":false,"image_description":null}}]\n\n'
+        f"For diagram questions: set has_image to true and fill image_description."
+    )
 
     try:
         text = clean_json(gemini_call(prompt))
@@ -303,8 +296,8 @@ def generate_svg(desc):
         prompt = (
             f"Create a simple SVG educational diagram for Indian exam.\n"
             f"Description: {desc}\n"
-            f"Rules: viewBox=\"0 0 400 300\", simple shapes only (rect, circle, line, text), "
-            f"black strokes, white fills, clear labels 12-14px, exam-style clean diagram.\n"
+            f'Rules: viewBox="0 0 400 300", simple shapes only (rect, circle, line, text), '
+            f"black strokes, white fills, clear labels 12-14px, clean exam-style.\n"
             f"Output ONLY the SVG code starting with <svg"
         )
         svg = gemini_call(prompt)
@@ -322,14 +315,15 @@ def translate(q_en, opts_en, exp_en):
     prompt = (
         f"Translate this Indian exam MCQ to: {lang_list}\n\n"
         f"Rules:\n"
-        f"- Keep unchanged: Gandhi, Ambedkar, Nehru, Delhi, Mumbai, Lok Sabha, Rajya Sabha, "
-        f"RBI, article numbers, act names, years, exam terms\n"
+        f"- Keep UNCHANGED: Gandhi, Ambedkar, Nehru, Delhi, Mumbai, "
+        f"Lok Sabha, Rajya Sabha, RBI, article numbers, act names, years\n"
         f"- Use native script for each language\n"
-        f"- Return ONLY valid JSON\n\n"
+        f"- Return ONLY valid JSON, nothing else\n\n"
         f"Question: {q_en}\n"
         f"Options: {json.dumps(opts_en)}\n"
         f"Explanation: {exp_en}\n\n"
-        f'Output ONLY JSON: {{"hi":{{"question":"","options":["","","",""],"explanation":""}},'
+        f"Output ONLY this JSON structure:\n"
+        f'{{"hi":{{"question":"","options":["","","",""],"explanation":""}},'
         f'"bn":{{"question":"","options":["","","",""],"explanation":""}},'
         f'"te":{{"question":"","options":["","","",""],"explanation":""}},'
         f'"ta":{{"question":"","options":["","","",""],"explanation":""}},'
@@ -423,7 +417,47 @@ def move_to_pool(db, exam_type):
 
     batch.commit()
     meta.update({"moved_to_pool": True})
-    log.info(f"Moved {count} questions to main pool: {exam_type}")
+    log.info(f"Moved {count} to main pool: {exam_type}")
+    return count
+
+# ── RETRANSLATE MISSING (fix English-only questions) ─────────
+def retranslate_missing(db, exam_type, date=None):
+    """Find questions uploaded without translations and fix them"""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+
+    log.info(f"Retranslating missing translations: {exam_type} {date}")
+    doc_id = f"{date}_{exam_type}"
+    ref = db.collection("dailyQuestions").document(doc_id).collection("questions")
+    docs = ref.get()
+    count = 0
+
+    for doc in docs:
+        data = doc.to_dict()
+        # Check if Hindi translation is missing (proxy for all translations)
+        if not data.get("question_hi"):
+            log.info(f"  Translating: {data['question_en'][:40]}")
+            trans = translate(
+                data["question_en"],
+                data["options_en"],
+                data["explanation_en"]
+            )
+            time.sleep(DELAY_TRANSLATE)
+
+            if trans:
+                update_data = {}
+                for lang, t in trans.items():
+                    if isinstance(t, dict):
+                        update_data[f"question_{lang}"] = t.get("question", data["question_en"])
+                        update_data[f"options_{lang}"] = t.get("options", data["options_en"])
+                        update_data[f"explanation_{lang}"] = t.get("explanation", data["explanation_en"])
+                doc.reference.update(update_data)
+                count += 1
+                log.info(f"  Updated with {len(trans)} languages ✅")
+            else:
+                log.warning(f"  Translation failed, skipping")
+
+    log.info(f"Retranslated {count} questions for {exam_type}")
     return count
 
 # ── MAIN JOB ──────────────────────────────────────────────────
@@ -434,14 +468,18 @@ def run_exam_job(exam_type):
     try:
         db = init_firebase()
 
+        # Move yesterday's questions to main pool
         moved = move_to_pool(db, exam_type)
         log.info(f"Moved {moved} to main pool")
 
+        # Get today's topic
         topic = get_topic(db, exam_type)
         log.info(f"Topic: {topic}")
 
+        # Load existing for dedup
         existing = load_existing(db, exam_type)
 
+        # Generate questions
         raw = generate_questions(exam_type, topic, QUESTIONS_PER_EXAM, existing)
         if not raw:
             log.error("No questions generated")
@@ -449,6 +487,7 @@ def run_exam_job(exam_type):
 
         time.sleep(DELAY_API)
 
+        # Filter duplicates
         unique = filter_duplicates(raw, existing)
         if not unique:
             log.error("All questions were duplicates!")
@@ -462,7 +501,11 @@ def run_exam_job(exam_type):
         backup_file = f"backups/{exam_type}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
         with open(backup_file, "w", encoding="utf-8") as f:
             json.dump(final, f, ensure_ascii=False, indent=2)
-        log.info(f"Backup saved: {backup_file}")
+        log.info(f"Backup: {backup_file}")
+
+        # Wait before translation to let quota recover
+        log.info("Waiting 2 minutes before translation to recover quota...")
+        time.sleep(120)
 
         # Process each question
         docs = []
@@ -472,7 +515,7 @@ def run_exam_job(exam_type):
             # Generate SVG for diagram questions
             svg = None
             if q.get("has_image") and q.get("image_description"):
-                log.info(f"  Generating SVG...")
+                log.info("  Generating SVG...")
                 svg = generate_svg(q["image_description"])
                 time.sleep(DELAY_API)
 
@@ -481,15 +524,15 @@ def run_exam_job(exam_type):
             time.sleep(DELAY_TRANSLATE)
 
             docs.append(build_doc(q, trans, svg))
-            log.info(f"  Translated: {len(trans)} languages")
+            lang_count = len([k for k, v in trans.items() if isinstance(v, dict)])
+            log.info(f"  Translated: {lang_count} languages")
 
         # Upload to Firestore
         upload_daily(db, exam_type, docs)
 
         log.info(f"DONE: {exam_type}")
-        log.info(f"  Questions uploaded: {len(docs)}")
+        log.info(f"  Questions: {len(docs)}")
         log.info(f"  Duplicates removed: {len(raw) - len(unique)}")
-        log.info(f"  Languages: 11")
 
     except Exception as e:
         log.error(f"FAILED {exam_type}: {e}")
@@ -519,13 +562,28 @@ if __name__ == "__main__":
             db = init_firebase()
             for e in ["UPSC", "SSC", "BANKING", "RRB"]:
                 move_to_pool(db, e)
+        elif arg == "retranslate":
+            # Fix English-only questions
+            # Usage: python daily_generator.py retranslate UPSC 2026-04-20
+            db = init_firebase()
+            exam = sys.argv[2] if len(sys.argv) > 2 else "UPSC"
+            date = sys.argv[3] if len(sys.argv) > 3 else None
+            retranslate_missing(db, exam, date)
+        elif arg == "retranslate_all":
+            # Fix all 4 exams for today
+            db = init_firebase()
+            date = sys.argv[2] if len(sys.argv) > 2 else None
+            for e in ["UPSC", "SSC", "BANKING", "RRB"]:
+                retranslate_missing(db, e, date)
+                log.info("Waiting 3 minutes before next exam...")
+                time.sleep(180)
         elif arg == "test_dedup":
             db = init_firebase()
             exam = sys.argv[2] if len(sys.argv) > 2 else "UPSC"
             ex = load_existing(db, exam)
             if ex:
                 result = filter_duplicates([{"question_en": ex[0]}], ex[1:])
-                log.info(f"Test: {len(result)} unique (expected 0 — same question)")
+                log.info(f"Test: {len(result)} unique (expected 0)")
         sys.exit(0)
 
     # Scheduled 24/7 mode
@@ -539,10 +597,9 @@ if __name__ == "__main__":
     log.info("Schedule (IST): UPSC=6AM | SSC=12PM | Banking=6PM | RRB=12AM")
     log.info("Running UPSC now as initial test...")
 
-    # Only run UPSC once on startup as test
     run_exam_job("UPSC")
 
-    log.info("Scheduler running 24/7. Waiting for next scheduled time...")
+    log.info("Scheduler running 24/7. Waiting for scheduled times...")
     while True:
         schedule.run_pending()
         time.sleep(60)
