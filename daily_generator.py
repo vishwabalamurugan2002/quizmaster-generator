@@ -67,21 +67,38 @@ def init_firebase():
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-flash"
+]
+
 def gemini_call(prompt, retries=4):
-    for attempt in range(retries):
-        try:
-            return client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text.strip()
-        except Exception as e:
-            err = str(e)
-            if "429" in err:
-                m = re.search(r"retry in (\d+)", err)
-                wait = int(m.group(1)) + 10 if m else 60*(attempt+1)
-                log.warning(f"Rate limited {wait}s"); time.sleep(wait)
-            elif "503" in err or "500" in err:
-                time.sleep(30*(attempt+1))
-            else:
-                raise e
-    raise Exception("Gemini failed")
+    for model in GEMINI_MODELS:
+        for attempt in range(retries):
+            try:
+                r = client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+                return r.text.strip()
+            except Exception as e:
+                err = str(e)
+                if "429" in err:
+                    m = re.search(r"retry in (\d+)", err)
+                    wait = int(m.group(1)) + 10 if m else 60*(attempt+1)
+                    log.warning(f"Rate limited {wait}s on {model}"); time.sleep(wait)
+                elif "503" in err or "500" in err:
+                    wait = 30*(attempt+1)
+                    log.warning(f"Server error on {model}, waiting {wait}s")
+                    time.sleep(wait)
+                elif "404" in err or "403" in err:
+                    log.warning(f"Model {model} not available, trying next")
+                    break  # Try next model
+                else:
+                    log.error(f"Unexpected error: {e}")
+                    raise e
+    raise Exception("All Gemini models failed")
 
 def clean_json(text):
     text = re.sub(r"```json\s*|```\s*", "", text).strip()
